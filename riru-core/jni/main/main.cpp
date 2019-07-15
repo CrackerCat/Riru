@@ -13,6 +13,7 @@
 #include <dirent.h>
 #include <xhook/xhook.h>
 #include <iterator>
+#include <sys/system_properties.h>
 
 #include "misc.h"
 #include "jni_native_method.h"
@@ -21,18 +22,10 @@
 #include "module.h"
 #include "JNIHelper.h"
 #include "api.h"
+#include "version.h"
 
 #define CONFIG_DIR "/data/misc/riru"
-
-#ifdef __LP64__
-#define ZYGOTE_NAME "zygote64"
-#define APP_PROCESS_NAME "/system/bin/app_process64"
-#define ANDROID_RUNTIME_LIBRARY "/system/lib64/libandroid_runtime.so"
-#else
-#define ZYGOTE_NAME "zygote"
-#define APP_PROCESS_NAME "/system/bin/app_process"
-#define ANDROID_RUNTIME_LIBRARY "/system/lib/libandroid_runtime.so"
-#endif
+#define CONFIG_DIR_MAGISK "/sbin/riru"
 
 #ifdef __LP64__
 #define MODULE_PATH_FMT "/system/lib64/libriru_%s.so"
@@ -40,19 +33,42 @@
 #define MODULE_PATH_FMT "/system/lib/libriru_%s.so"
 #endif
 
-int methods_replaced = 0;
+static int methods_replaced = 0;
+static int sdkLevel;
+static int previewSdkLevel;
+static char androidVersionName[PROP_VALUE_MAX + 1];
 
 int riru_is_zygote_methods_replaced() {
     return methods_replaced;
 }
 
+static int isQ() {
+    return (sdkLevel == 28 && previewSdkLevel > 0) || sdkLevel >= 29;
+}
+
+static const char *config_dir = nullptr;
+
+static const char* get_config_dir() {
+    if (config_dir) return config_dir;
+
+    if (access(CONFIG_DIR_MAGISK, R_OK) == 0) {
+        config_dir = CONFIG_DIR_MAGISK;
+    } else {
+        config_dir = CONFIG_DIR;
+    }
+    return config_dir;
+}
+
 static void load_modules() {
     DIR *dir;
     struct dirent *entry;
-    char path[256];
+    char path[PATH_MAX], modules_path[PATH_MAX], module_prop[PATH_MAX], api[PATH_MAX];
+    int moduleApiVersion;
     void *handle;
 
-    if (!(dir = _opendir(CONFIG_DIR "/modules")))
+    snprintf(modules_path, PATH_MAX, "%s/modules", get_config_dir());
+
+    if (!(dir = _opendir(modules_path)))
         return;
 
     while ((entry = _readdir(dir))) {
@@ -60,10 +76,26 @@ static void load_modules() {
             if (entry->d_name[0] == '.')
                 continue;
 
-            snprintf(path, 256, MODULE_PATH_FMT, entry->d_name);
+            snprintf(path, PATH_MAX, MODULE_PATH_FMT, entry->d_name);
 
             if (access(path, F_OK) != 0) {
                 PLOGE("access %s", path);
+                continue;
+            }
+
+            snprintf(module_prop, PATH_MAX, "%s/%s/module.prop", modules_path, entry->d_name);
+            if (access(module_prop, F_OK) != 0) {
+                PLOGE("access %s", module_prop);
+                continue;
+            }
+
+            moduleApiVersion = -1;
+            if (get_prop(module_prop, "api", api) > 0) {
+                moduleApiVersion = atoi(api);
+            }
+
+            if (isQ() && moduleApiVersion < 3) {
+                LOGW("module %s does not support Android Q", entry->d_name);
                 continue;
             }
 
@@ -80,24 +112,27 @@ static void load_modules() {
             module->forkAndSpecializePost = dlsym(handle, "nativeForkAndSpecializePost");
             module->forkSystemServerPre = dlsym(handle, "nativeForkSystemServerPre");
             module->forkSystemServerPost = dlsym(handle, "nativeForkSystemServerPost");
+            module->specializeAppProcessPre = dlsym(handle, "specializeAppProcessPre");
+            module->specializeAppProcessPost = dlsym(handle, "specializeAppProcessPost");
             module->shouldSkipUid = dlsym(handle, "shouldSkipUid");
-            module->getApiVersion = dlsym(handle, "getApiVersion");
-
             get_modules()->push_back(module);
 
-            if (module->getApiVersion) {
-                module->apiVersion = ((getApiVersion_t) module->getApiVersion)();
+            if (moduleApiVersion == -1) {
+                // only for api v2
+                module->getApiVersion = dlsym(handle, "getApiVersion");
+
+                if (module->getApiVersion) {
+                    module->apiVersion = ((getApiVersion_t) module->getApiVersion)();
+                }
+            } else {
+                module->apiVersion = moduleApiVersion;
             }
 
             void *sym = dlsym(handle, "riru_set_module_name");
             if (sym)
                 ((void (*)(const char *)) sym)(module->name);
 
-#ifdef __LP64__
-            LOGI("module loaded: %s (api %d), count=%lu", module->name, module->apiVersion, get_modules()->size());
-#else
-            LOGI("module loaded: %s %u", module->name, get_modules()->size());
-#endif
+            LOGI("module loaded: %s (api %d)", module->name, module->apiVersion);
 
             if (module->onModuleLoaded) {
                 LOGV("%s: onModuleLoaded", module->name);
@@ -130,6 +165,8 @@ static JNINativeMethod *onRegisterZygote(JNIEnv *env, const char *className,
                 newMethods[i].fnPtr = (void *) nativeForkAndSpecialize_oreo;
             else if (strcmp(nativeForkAndSpecialize_p_sig, method.signature) == 0)
                 newMethods[i].fnPtr = (void *) nativeForkAndSpecialize_p;
+            else if (strcmp(nativeForkAndSpecialize_q_beta4_sig, method.signature) == 0)
+                newMethods[i].fnPtr = (void *) nativeForkAndSpecialize_q_beta4;
             else if (strcmp(nativeForkAndSpecialize_samsung_p_sig, method.signature) == 0)
                 newMethods[i].fnPtr = (void *) nativeForkAndSpecialize_samsung_p;
             else if (strcmp(nativeForkAndSpecialize_samsung_o_sig, method.signature) == 0)
@@ -147,6 +184,23 @@ static JNINativeMethod *onRegisterZygote(JNIEnv *env, const char *className,
                                             newMethods[i].signature, newMethods[i].fnPtr);
 
                 replaced += 1;
+            }
+        } else if (strcmp(method.name, "nativeSpecializeAppProcess") == 0) {
+            set_nativeSpecializeAppProcess(method.fnPtr);
+
+            if (strcmp(nativeSpecializeAppProcess_sig_q_beta4, method.signature) == 0)
+                newMethods[i].fnPtr = (void *) nativeSpecializeAppProcess_q_beta4;
+            else if (strcmp(nativeSpecializeAppProcess_sig_q, method.signature) == 0)
+                newMethods[i].fnPtr = (void *) nativeSpecializeAppProcess_q;
+            else
+                LOGW("found nativeSpecializeAppProcess but signature %s mismatch", method.signature);
+
+            if (newMethods[i].fnPtr != methods[i].fnPtr) {
+                LOGI("replaced com.android.internal.os.Zygote#nativeSpecializeAppProcess");
+                riru_set_native_method_func(MODULE_NAME_CORE, className, newMethods[i].name,
+                                            newMethods[i].signature, newMethods[i].fnPtr);
+
+                //replaced += 1;
             }
         } else if (strcmp(method.name, "nativeForkSystemServer") == 0) {
             set_nativeForkSystemServer(method.fnPtr);
@@ -166,7 +220,7 @@ static JNINativeMethod *onRegisterZygote(JNIEnv *env, const char *className,
         }
     }
 
-    methods_replaced = replaced == 2;
+    methods_replaced = replaced == 2/*(isQ() ? 3 : 2)*/;
 
     return newMethods;
 }
@@ -199,8 +253,8 @@ static JNINativeMethod *onRegisterSystemProperties(JNIEnv *env, const char *clas
     return newMethods;
 }
 
-#define XHOOK_REGISTER(NAME) \
-    if (xhook_register(".*", #NAME, (void*) new_##NAME, (void **) &old_##NAME) != 0) \
+#define XHOOK_REGISTER(PATH_REGEX, NAME) \
+    if (xhook_register(PATH_REGEX, #NAME, (void*) new_##NAME, (void **) &old_##NAME) != 0) \
         LOGE("failed to register hook " #NAME "."); \
 
 #define NEW_FUNC_DEF(ret, func, ...) \
@@ -222,34 +276,72 @@ NEW_FUNC_DEF(int, jniRegisterNativeMethods, JNIEnv *env, const char *className,
         newMethods = onRegisterSystemProperties(env, className, methods, numMethods);
     }
 
-    int res = old_jniRegisterNativeMethods(env, className, newMethods ? newMethods : methods, numMethods);
+    int res = old_jniRegisterNativeMethods(env, className, newMethods ? newMethods : methods,
+                                           numMethods);
     delete newMethods;
     return res;
 }
 
-extern "C" void riru_constructor() __attribute__((constructor));
+void unhook_jniRegisterNativeMethods() {
+    xhook_register(".*\\libandroid_runtime.so$", "jniRegisterNativeMethods",
+                   (void *) old_jniRegisterNativeMethods,
+                   nullptr);
+    if (xhook_refresh(0) == 0) {
+        xhook_clear();
+        LOGV("hook removed");
+    }
+}
 
-void riru_constructor() {
+static void read_prop() {
+    char sdk[PROP_VALUE_MAX + 1];
+    if (__system_property_get("ro.build.version.sdk", sdk) > 0)
+        sdkLevel = atoi(sdk);
+
+    if (__system_property_get("ro.build.version.preview_sdk", sdk) > 0)
+        previewSdkLevel = atoi(sdk);
+
+    __system_property_get("ro.build.version.release", androidVersionName);
+
+    LOGI("system version %s (api %d, preview_sdk %d)", androidVersionName, sdkLevel, previewSdkLevel);
+}
+
+extern "C" void constructor() __attribute__((constructor));
+
+void constructor() {
     static int loaded = 0;
     if (loaded)
         return;
 
     loaded = 1;
 
-    if (access(CONFIG_DIR "/.disable", F_OK) == 0) {
-        LOGI(CONFIG_DIR
-                     "/.disable exists, do nothing.");
+    if (getuid() != 0)
+        return;
+
+    char cmdline[ARG_MAX + 1];
+    get_self_cmdline(cmdline);
+
+    if (!strstr(cmdline, "--zygote"))
+        return;
+
+#ifdef __LP64__
+    LOGI("Riru %s in zygote64", VERSION_NAME);
+#else
+    LOGI("Riru %s in zygote", VERSION_NAME);
+#endif
+
+    LOGI("config dir is %s", get_config_dir());
+
+    char path[PATH_MAX];
+    snprintf(path, PATH_MAX, "%s/.disable", get_config_dir());
+
+    if (access(path, F_OK) == 0) {
+        LOGI("%s exists, do nothing.", path);
         return;
     }
 
-    char buf[64];
-    get_proc_name(getpid(), buf, 63);
-    if (strncmp(ZYGOTE_NAME, buf, strlen(ZYGOTE_NAME)) != 0 &&
-        strncmp(APP_PROCESS_NAME, buf, strlen(APP_PROCESS_NAME)) != 0) {
-        return;
-    }
+    read_prop();
 
-    XHOOK_REGISTER(jniRegisterNativeMethods);
+    XHOOK_REGISTER(".*\\libandroid_runtime.so$", jniRegisterNativeMethods);
 
     if (xhook_refresh(0) == 0) {
         xhook_clear();
